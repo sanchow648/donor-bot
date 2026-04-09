@@ -4,6 +4,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "playwright install && python main.py"
+    "startCommand": "playwright install --with-deps && python main.py"
   }
 }
