@@ -1,14 +1,21 @@
 import time
 import os
+import requests
 from playwright.sync_api import sync_playwright
 
 
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 LOGIN = os.getenv("LOGIN")
 PASSWORD = os.getenv("PASSWORD")
 
 
-def log(msg):
-    print(msg, flush=True)
+def send_message(text):
+    requests.get(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        params={"chat_id": CHAT_ID, "text": text},
+        timeout=15
+    )
 
 
 def safe_close_popup(page):
@@ -22,171 +29,101 @@ def safe_close_popup(page):
     for sel in selectors:
         try:
             page.locator(sel).first.click(timeout=1000)
-            page.wait_for_timeout(700)
-            return True
+            page.wait_for_timeout(500)
+            return
         except:
             pass
 
     try:
         page.keyboard.press("Escape")
-        page.wait_for_timeout(700)
-        return True
+        page.wait_for_timeout(500)
     except:
         pass
 
-    return False
 
-
-def extract_block_text(page, index):
-    try:
-        button = page.locator("text=Забронировать время").nth(index)
-        container = button.locator("xpath=ancestor::div[1]")
-        return container.inner_text(timeout=2000)
-    except:
-        return None
-
-
-def analyze_popup_text(text):
-    text = text.lower()
-
-    no_slots_markers = [
-        "все свободные места для записи закончились",
-        "на данный момент все свободные места для записи закончились",
-    ]
-
-    success_markers = [
-        "выберите время",
-        "доступное время",
-        "подтвердите, что вы не робот",
-        "я не робот",
-        "captcha",
-        "капча",
-        "recaptcha",
-    ]
-
-    if any(marker in text for marker in no_slots_markers):
-        return "NO_SLOTS"
-
-    if any(marker in text for marker in success_markers):
-        return "REAL_SLOT"
-
-    return "UNKNOWN"
-
-
-def run_debug_check():
+def check_slots():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         try:
-            log("=== START DEBUG CHECK ===")
-
+            # Открываем сайт и логинимся
             page.goto("https://donor-mos.online/", timeout=60000)
             page.wait_for_timeout(2000)
-            log("Открыта главная страница")
 
             page.fill('input[type="text"]', LOGIN)
             page.fill('input[type="password"]', PASSWORD)
             page.click("button:has-text('Авторизоваться')")
             page.wait_for_timeout(5000)
-            log("Попытка авторизации выполнена")
 
+            # Открываем личный кабинет
             page.goto("https://donor-mos.online/account/", timeout=60000)
             page.wait_for_timeout(4000)
-            log("Открыт личный кабинет")
-
-            page_text = page.content().lower()
-            if "авторизоваться" in page_text and "пароль" in page_text:
-                log("Похоже, авторизация не удалась: снова видна форма входа")
-                browser.close()
-                return
 
             buttons = page.locator("text=Забронировать время")
             count = buttons.count()
-            log(f"Найдено кнопок 'Забронировать время': {count}")
+
+            print(f"Найдено кнопок: {count}", flush=True)
 
             if count == 0:
-                log("Кнопок не найдено, проверка завершена")
                 browser.close()
-                return
+                return False
 
             for i in range(count):
-                log("")
-                log(f"--- Проверка кнопки #{i + 1} ---")
-
                 page.goto("https://donor-mos.online/account/", timeout=60000)
                 page.wait_for_timeout(3000)
 
                 buttons = page.locator("text=Забронировать время")
                 current_count = buttons.count()
-                log(f"После обновления страницы доступно кнопок: {current_count}")
 
                 if i >= current_count:
-                    log("Эта кнопка исчезла после обновления страницы, пропускаю")
                     continue
 
-                block_text = extract_block_text(page, i)
-                if block_text:
-                    log("Текст блока рядом с кнопкой:")
-                    log(block_text[:1000])
-                else:
-                    log("Не удалось вытащить текст блока")
+                print(f"Проверяю кнопку #{i + 1}", flush=True)
 
                 try:
                     buttons.nth(i).click(timeout=5000)
-                    log("Клик по кнопке выполнен")
                 except Exception as e:
-                    log(f"Не удалось кликнуть по кнопке: {e}")
+                    print(f"Не удалось кликнуть по кнопке #{i + 1}: {e}", flush=True)
                     continue
 
                 page.wait_for_timeout(3000)
 
-                popup_text = page.content()
-                result = analyze_popup_text(popup_text)
+                popup_text = page.content().lower()
 
-                log(f"Результат анализа после клика: {result}")
+                # Если явно показано, что свободных мест нет — идём дальше
+                if "все свободные места для записи закончились" in popup_text:
+                    print(f"Кнопка #{i + 1}: мест нет", flush=True)
+                    safe_close_popup(page)
+                    continue
 
-                popup_lower = popup_text.lower()
+                # Если текста про отсутствие мест нет — считаем, что слот появился
+                print(f"Кнопка #{i + 1}: похоже, слот есть", flush=True)
+                browser.close()
+                return True
 
-                interesting_markers = [
-                    "все свободные места для записи закончились",
-                    "выберите время",
-                    "доступное время",
-                    "подтвердите, что вы не робот",
-                    "я не робот",
-                    "captcha",
-                    "капча",
-                    "recaptcha",
-                ]
-
-                found = [m for m in interesting_markers if m in popup_lower]
-                if found:
-                    log(f"Найдены маркеры: {found}")
-                else:
-                    log("Явные маркеры не найдены")
-
-                log("Фрагмент HTML/текста после клика:")
-                snippet = popup_text.replace("\n", " ")
-                log(snippet[:1500])
-
-                closed = safe_close_popup(page)
-                log(f"Попытка закрыть попап: {'успешно' if closed else 'не удалось / не требовалось'}")
-
-            log("")
-            log("=== DEBUG CHECK FINISHED ===")
             browser.close()
+            return False
 
         except Exception as e:
-            log(f"ОШИБКА: {e}")
+            print(f"Ошибка в check_slots: {e}", flush=True)
             try:
                 browser.close()
             except:
                 pass
+            return False
 
 
-print("DEBUG BOT STARTED", flush=True)
+print("БОТ ЗАПУЩЕН", flush=True)
+
+last_state = False
 
 while True:
-    run_debug_check()
-    print("Жду 60 секунд до следующей проверки...", flush=True)
+    current_state = check_slots()
+
+    if current_state and not last_state:
+        send_message("🔥 Похоже, появился слот. Срочно зайди в donor-mos и попробуй записаться.")
+
+    last_state = current_state
+
     time.sleep(60)
