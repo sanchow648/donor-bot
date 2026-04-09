@@ -51,7 +51,6 @@ def check_slots():
 
 
 print("Бот запущен...")
-send_message("✅ Бот запущен и работает!")
 
 last_state = False
 
