@@ -1,14 +1,15 @@
 import time
 import os
+import json
 import re
+import tempfile
 import requests
 from playwright.sync_api import sync_playwright
 
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-LOGIN = os.getenv("LOGIN")
-PASSWORD = os.getenv("PASSWORD")
+STORAGE_STATE_JSON = os.getenv("STORAGE_STATE_JSON")
 
 ACCOUNT_URL = "https://donor-mos.online/account/"
 
@@ -35,95 +36,148 @@ def safe_close_popup(page):
 
     for sel in selectors:
         try:
-            page.locator(sel).first.click(timeout=1000)
-            page.wait_for_timeout(500)
+            page.locator(sel).first.click(timeout=700)
+            page.wait_for_timeout(300)
             return
         except:
             pass
 
     try:
         page.keyboard.press("Escape")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     except:
         pass
 
 
-def normalize_spaces(text):
-    return re.sub(r"\s+", " ", text).strip()
+def build_context(browser):
+    if not STORAGE_STATE_JSON:
+        raise RuntimeError("Не задана переменная STORAGE_STATE_JSON")
+
+    state_data = json.loads(STORAGE_STATE_JSON)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(state_data, f, ensure_ascii=False)
+        state_path = f.name
+
+    return browser.new_context(storage_state=state_path)
 
 
-def extract_dates_from_text(text):
-    matches = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", text)
-    return matches
-
-
-def get_block_text_for_button(page, index):
+def extract_date_for_button(button_locator, fallback_index):
+    """
+    Пытаемся найти дату именно для этой кнопки.
+    Идём вверх по DOM и ищем ближайший осмысленный блок с датой.
+    """
     try:
-        button = page.locator("text=Забронировать время").nth(index)
-        # Берем более широкий контейнер вокруг кнопки
-        block = button.locator("xpath=ancestor::div[1]")
-        text = block.inner_text(timeout=2000)
-        return normalize_spaces(text)
+        result = button_locator.evaluate(
+            """
+            (el) => {
+                function normalize(s) {
+                    return (s || "").replace(/\\s+/g, " ").trim();
+                }
+
+                function datesFrom(text) {
+                    const m = text.match(/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/g);
+                    return m || [];
+                }
+
+                const buttonText = normalize(el.innerText || "Забронировать время");
+                let node = el;
+
+                while (node) {
+                    const text = normalize(node.innerText || "");
+                    const dates = datesFrom(text);
+
+                    if (dates.length === 1) {
+                        return dates[0];
+                    }
+
+                    if (dates.length > 1) {
+                        const pos = text.indexOf(buttonText);
+                        if (pos >= 0) {
+                            const before = text.slice(0, pos);
+                            const beforeDates = datesFrom(before);
+                            if (beforeDates.length > 0) {
+                                return beforeDates[beforeDates.length - 1];
+                            }
+                        }
+                        return dates[dates.length - 1];
+                    }
+
+                    node = node.parentElement;
+                }
+
+                return null;
+            }
+            """
+        )
+
+        if result:
+            return result
     except:
-        return ""
+        pass
+
+    return f"кнопка #{fallback_index + 1}"
 
 
-def get_button_date(page, index):
-    block_text = get_block_text_for_button(page, index)
-    dates = extract_dates_from_text(block_text)
+def get_booking_buttons(page):
+    return page.locator("text=Забронировать время")
 
-    if dates:
-        return dates[0]
 
-    return f"кнопка #{index + 1}"
+def page_shows_login_form(page):
+    html = page.content().lower()
+    return "авторизоваться" in html and "пароль" in html
 
 
 def check_slots():
+    """
+    Возвращает список дат, на которых, похоже, реально появились слоты.
+    """
+    available_dates = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
 
         try:
-            page.goto("https://donor-mos.online/", timeout=60000)
-            page.wait_for_timeout(2000)
-
-            page.fill('input[type="text"]', LOGIN)
-            page.fill('input[type="password"]', PASSWORD)
-            page.click("button:has-text('Авторизоваться')")
-            page.wait_for_timeout(5000)
+            context = build_context(browser)
+            page = context.new_page()
 
             page.goto(ACCOUNT_URL, timeout=60000)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(2000)
 
-            buttons = page.locator("text=Забронировать время")
+            if page_shows_login_form(page):
+                raise RuntimeError("Сессия протухла: сайт снова показывает форму входа")
+
+            buttons = get_booking_buttons(page)
             count = buttons.count()
 
             log(f"Найдено кнопок: {count}")
 
             if count == 0:
                 browser.close()
-                return False, None
+                return []
 
             for i in range(count):
                 page.goto(ACCOUNT_URL, timeout=60000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1500)
 
-                buttons = page.locator("text=Забронировать время")
+                buttons = get_booking_buttons(page)
                 current_count = buttons.count()
 
                 if i >= current_count:
                     continue
 
-                button_date = get_button_date(page, i)
+                button = buttons.nth(i)
+                button_date = extract_date_for_button(button, i)
+
                 log(f"Проверяю {button_date}")
 
                 try:
-                    buttons.nth(i).click(timeout=5000)
+                    button.click(timeout=4000)
                 except Exception as e:
                     log(f"Не удалось кликнуть по {button_date}: {e}")
                     continue
 
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1500)
 
                 popup_text = page.content().lower()
 
@@ -133,11 +187,11 @@ def check_slots():
                     continue
 
                 log(f"{button_date}: похоже, слот есть")
-                browser.close()
-                return True, button_date
+                available_dates.append(button_date)
+                safe_close_popup(page)
 
             browser.close()
-            return False, None
+            return available_dates
 
         except Exception as e:
             log(f"Ошибка в check_slots: {e}")
@@ -145,31 +199,58 @@ def check_slots():
                 browser.close()
             except:
                 pass
-            return False, None
+            return []
 
 
-log("БОТ ЗАПУЩЕН")
+def make_alert_signature(dates):
+    return "|".join(sorted(set(dates)))
 
-last_state = False
-last_slot_label = None
+
+def build_alert_text(dates):
+    unique_dates = sorted(set(dates))
+
+    if len(unique_dates) == 1:
+        return (
+            "🔥 Похоже, появился слот.\n\n"
+            f"Дата: {unique_dates[0]}\n\n"
+            "Срочно зайди в donor-mos и попробуй записаться."
+        )
+
+    dates_text = "\n".join(f"• {d}" for d in unique_dates)
+
+    return (
+        "🔥 Похоже, появились слоты на несколько дат.\n\n"
+        f"{dates_text}\n\n"
+        "Срочно зайди в donor-mos и попробуй записаться."
+    )
+
+
+log("БОТ 3.1 ЗАПУЩЕН")
+
+last_alert_signature = None
 
 while True:
-    current_state, slot_label = check_slots()
+    started_at = time.strftime("%H:%M:%S")
+    log(f"Старт проверки: {started_at}")
 
-    if current_state and not last_state:
-        if slot_label:
-            send_message(
-                f"🔥 Похоже, появился слот на дату {slot_label}.\n"
-                f"Срочно зайди в donor-mos и попробуй записаться."
-            )
+    available_dates = check_slots()
+
+    finished_at = time.strftime("%H:%M:%S")
+    log(f"Конец проверки: {finished_at}")
+
+    if available_dates:
+        current_signature = make_alert_signature(available_dates)
+        log(f"Найдены доступные даты: {', '.join(sorted(set(available_dates)))}")
+
+        if current_signature != last_alert_signature:
+            send_message(build_alert_text(available_dates))
+            last_alert_signature = current_signature
+            log("Отправлено уведомление в Telegram")
         else:
-            send_message(
-                "🔥 Похоже, появился слот.\n"
-                "Срочно зайди в donor-mos и попробуй записаться."
-            )
-
-    last_state = current_state
-    last_slot_label = slot_label
+            log("Слоты есть, но уведомление уже отправлялось ранее")
+    else:
+        log("Слотов не найдено")
+        last_alert_signature = None
 
     log("Жду 30 секунд до следующей проверки...")
     time.sleep(30)
