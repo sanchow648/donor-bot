@@ -9,9 +9,13 @@ from playwright.sync_api import sync_playwright
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+LOGIN = os.getenv("LOGIN")
+PASSWORD = os.getenv("PASSWORD")
 STORAGE_STATE_JSON = os.getenv("STORAGE_STATE_JSON")
 
 ACCOUNT_URL = "https://donor-mos.online/account/"
+LOGIN_URL = "https://donor-mos.online/"
+RUNTIME_STATE_FILE = "/tmp/donor_runtime_state.json"
 
 
 def log(message):
@@ -49,24 +53,92 @@ def safe_close_popup(page):
         pass
 
 
-def build_context(browser):
+def normalize_spaces(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def page_shows_login_form(page):
+    html = page.content().lower()
+    return "авторизоваться" in html and "пароль" in html
+
+
+def save_context_state(context):
+    try:
+        context.storage_state(path=RUNTIME_STATE_FILE)
+        log("Runtime-сессия сохранена")
+    except Exception as e:
+        log(f"Не удалось сохранить runtime-сессию: {e}")
+
+
+def seed_runtime_state_from_env():
+    if os.path.exists(RUNTIME_STATE_FILE):
+        return
+
     if not STORAGE_STATE_JSON:
-        raise RuntimeError("Не задана переменная STORAGE_STATE_JSON")
+        return
 
-    state_data = json.loads(STORAGE_STATE_JSON)
+    try:
+        state_data = json.loads(STORAGE_STATE_JSON)
+        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, ensure_ascii=False)
+        log("Runtime-сессия инициализирована из STORAGE_STATE_JSON")
+    except Exception as e:
+        log(f"Не удалось инициализировать runtime-сессию из env: {e}")
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(state_data, f, ensure_ascii=False)
-        state_path = f.name
 
-    return browser.new_context(storage_state=state_path)
+def build_context_from_runtime(browser):
+    if not os.path.exists(RUNTIME_STATE_FILE):
+        return browser.new_context()
+
+    return browser.new_context(storage_state=RUNTIME_STATE_FILE)
+
+
+def login_and_refresh_session(context):
+    if not LOGIN or not PASSWORD:
+        raise RuntimeError("Нет LOGIN/PASSWORD для обновления сессии")
+
+    page = context.new_page()
+    page.goto(LOGIN_URL, timeout=60000)
+    page.wait_for_timeout(1500)
+
+    page.fill('input[type="text"]', LOGIN)
+    page.fill('input[type="password"]', PASSWORD)
+    page.click("button:has-text('Авторизоваться')")
+    page.wait_for_timeout(4000)
+
+    page.goto(ACCOUNT_URL, timeout=60000)
+    page.wait_for_timeout(2000)
+
+    if page_shows_login_form(page):
+        raise RuntimeError("Логин не удался: сайт снова показывает форму входа")
+
+    save_context_state(context)
+    log("Сессия обновлена через LOGIN/PASSWORD")
+    return page
+
+
+def open_account_page(browser):
+    """
+    Пытаемся сначала зайти по runtime-сессии.
+    Если она протухла, перелогиниваемся и обновляем runtime-сессию.
+    """
+    context = build_context_from_runtime(browser)
+    page = context.new_page()
+
+    page.goto(ACCOUNT_URL, timeout=60000)
+    page.wait_for_timeout(1500)
+
+    if page_shows_login_form(page):
+        log("Сессия протухла, пробую перелогиниться...")
+        context.close()
+
+        context = browser.new_context()
+        page = login_and_refresh_session(context)
+
+    return context, page
 
 
 def extract_date_for_button(button_locator, fallback_index):
-    """
-    Пытаемся найти дату именно для этой кнопки.
-    Идём вверх по DOM и ищем ближайший осмысленный блок с датой.
-    """
     try:
         result = button_locator.evaluate(
             """
@@ -123,29 +195,15 @@ def get_booking_buttons(page):
     return page.locator("text=Забронировать время")
 
 
-def page_shows_login_form(page):
-    html = page.content().lower()
-    return "авторизоваться" in html and "пароль" in html
-
-
 def check_slots():
-    """
-    Возвращает список дат, на которых, похоже, реально появились слоты.
-    """
     available_dates = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
         try:
-            context = build_context(browser)
-            page = context.new_page()
-
-            page.goto(ACCOUNT_URL, timeout=60000)
-            page.wait_for_timeout(2000)
-
-            if page_shows_login_form(page):
-                raise RuntimeError("Сессия протухла: сайт снова показывает форму входа")
+            seed_runtime_state_from_env()
+            context, page = open_account_page(browser)
 
             buttons = get_booking_buttons(page)
             count = buttons.count()
@@ -153,12 +211,21 @@ def check_slots():
             log(f"Найдено кнопок: {count}")
 
             if count == 0:
+                context.close()
                 browser.close()
                 return []
 
             for i in range(count):
                 page.goto(ACCOUNT_URL, timeout=60000)
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1200)
+
+                if page_shows_login_form(page):
+                    log("Во время проверки сессия слетела, перелогиниваюсь...")
+                    context.close()
+                    context = browser.new_context()
+                    page = login_and_refresh_session(context)
+                    page.goto(ACCOUNT_URL, timeout=60000)
+                    page.wait_for_timeout(1200)
 
                 buttons = get_booking_buttons(page)
                 current_count = buttons.count()
@@ -177,7 +244,7 @@ def check_slots():
                     log(f"Не удалось кликнуть по {button_date}: {e}")
                     continue
 
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(1200)
 
                 popup_text = page.content().lower()
 
@@ -190,6 +257,8 @@ def check_slots():
                 available_dates.append(button_date)
                 safe_close_popup(page)
 
+            save_context_state(context)
+            context.close()
             browser.close()
             return available_dates
 
@@ -225,7 +294,7 @@ def build_alert_text(dates):
     )
 
 
-log("БОТ 3.1 ЗАПУЩЕН")
+log("БОТ 3.2 ЗАПУЩЕН")
 
 last_alert_signature = None
 
