@@ -2,8 +2,9 @@ import time
 import os
 import json
 import re
-import tempfile
 import requests
+import multiprocessing
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 
@@ -16,6 +17,11 @@ STORAGE_STATE_JSON = os.getenv("STORAGE_STATE_JSON")
 ACCOUNT_URL = "https://donor-mos.online/account/"
 LOGIN_URL = "https://donor-mos.online/"
 RUNTIME_STATE_FILE = "/tmp/donor_runtime_state.json"
+
+CHECK_TIMEOUT_SECONDS = 45
+SLEEP_BETWEEN_CHECKS_SECONDS = 30
+
+HEARTBEAT_HOURS = {11, 23}
 
 
 def log(message):
@@ -31,30 +37,11 @@ def send_message(text):
 
 
 def safe_close_popup(page):
-    selectors = [
-        'button:has-text("×")',
-        'text=×',
-        '[aria-label="Close"]',
-        '[aria-label="Закрыть"]',
-    ]
-
-    for sel in selectors:
-        try:
-            page.locator(sel).first.click(timeout=700)
-            page.wait_for_timeout(300)
-            return
-        except:
-            pass
-
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
     except:
         pass
-
-
-def normalize_spaces(text):
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def page_shows_login_form(page):
@@ -66,39 +53,27 @@ def save_context_state(context):
     try:
         context.storage_state(path=RUNTIME_STATE_FILE)
         log("Runtime-сессия сохранена")
-    except Exception as e:
-        log(f"Не удалось сохранить runtime-сессию: {e}")
+    except:
+        pass
 
 
 def seed_runtime_state_from_env():
     if os.path.exists(RUNTIME_STATE_FILE):
         return
 
-    if not STORAGE_STATE_JSON:
-        return
-
-    try:
-        state_data = json.loads(STORAGE_STATE_JSON)
-        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state_data, f, ensure_ascii=False)
-        log("Runtime-сессия инициализирована из STORAGE_STATE_JSON")
-    except Exception as e:
-        log(f"Не удалось инициализировать runtime-сессию из env: {e}")
-
-
-def build_context_from_runtime(browser):
-    if not os.path.exists(RUNTIME_STATE_FILE):
-        return browser.new_context()
-
-    return browser.new_context(storage_state=RUNTIME_STATE_FILE)
+    if STORAGE_STATE_JSON:
+        try:
+            state_data = json.loads(STORAGE_STATE_JSON)
+            with open(RUNTIME_STATE_FILE, "w") as f:
+                json.dump(state_data, f)
+            log("Runtime-сессия восстановлена")
+        except:
+            pass
 
 
 def login_and_refresh_session(context):
-    if not LOGIN or not PASSWORD:
-        raise RuntimeError("Нет LOGIN/PASSWORD для обновления сессии")
-
     page = context.new_page()
-    page.goto(LOGIN_URL, timeout=60000)
+    page.goto(LOGIN_URL)
     page.wait_for_timeout(1500)
 
     page.fill('input[type="text"]', LOGIN)
@@ -106,103 +81,57 @@ def login_and_refresh_session(context):
     page.click("button:has-text('Авторизоваться')")
     page.wait_for_timeout(4000)
 
-    page.goto(ACCOUNT_URL, timeout=60000)
+    page.goto(ACCOUNT_URL)
     page.wait_for_timeout(2000)
 
-    if page_shows_login_form(page):
-        raise RuntimeError("Логин не удался: сайт снова показывает форму входа")
-
     save_context_state(context)
-    log("Сессия обновлена через LOGIN/PASSWORD")
+    log("Сессия обновлена")
     return page
 
 
 def open_account_page(browser):
-    """
-    Пытаемся сначала зайти по runtime-сессии.
-    Если она протухла, перелогиниваемся и обновляем runtime-сессию.
-    """
-    context = build_context_from_runtime(browser)
-    page = context.new_page()
+    if os.path.exists(RUNTIME_STATE_FILE):
+        context = browser.new_context(storage_state=RUNTIME_STATE_FILE)
+    else:
+        context = browser.new_context()
 
-    page.goto(ACCOUNT_URL, timeout=60000)
+    page = context.new_page()
+    page.goto(ACCOUNT_URL)
     page.wait_for_timeout(1500)
 
     if page_shows_login_form(page):
-        log("Сессия протухла, пробую перелогиниться...")
+        log("Сессия протухла → логинюсь заново")
         context.close()
-
         context = browser.new_context()
         page = login_and_refresh_session(context)
 
     return context, page
 
 
-def extract_date_for_button(button_locator, fallback_index):
-    try:
-        result = button_locator.evaluate(
-            """
-            (el) => {
-                function normalize(s) {
-                    return (s || "").replace(/\\s+/g, " ").trim();
-                }
-
-                function datesFrom(text) {
-                    const m = text.match(/\\b\\d{2}\\/\\d{2}\\/\\d{4}\\b/g);
-                    return m || [];
-                }
-
-                const buttonText = normalize(el.innerText || "Забронировать время");
-                let node = el;
-
-                while (node) {
-                    const text = normalize(node.innerText || "");
-                    const dates = datesFrom(text);
-
-                    if (dates.length === 1) {
-                        return dates[0];
-                    }
-
-                    if (dates.length > 1) {
-                        const pos = text.indexOf(buttonText);
-                        if (pos >= 0) {
-                            const before = text.slice(0, pos);
-                            const beforeDates = datesFrom(before);
-                            if (beforeDates.length > 0) {
-                                return beforeDates[beforeDates.length - 1];
-                            }
-                        }
-                        return dates[dates.length - 1];
-                    }
-
-                    node = node.parentElement;
-                }
-
-                return null;
-            }
-            """
-        )
-
-        if result:
-            return result
-    except:
-        pass
-
-    return f"кнопка #{fallback_index + 1}"
-
-
 def get_booking_buttons(page):
     return page.locator("text=Забронировать время")
 
 
-def check_slots():
-    available_dates = []
+def extract_date(button, i):
+    try:
+        text = button.locator("xpath=ancestor::*[1]").inner_text()
+        match = re.findall(r"\d{2}/\d{2}/\d{4}", text)
+        if match:
+            return match[-1]
+    except:
+        pass
+    return f"кнопка #{i+1}"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
 
-        try:
-            seed_runtime_state_from_env()
+def _check_worker(queue):
+    dates = []
+
+    try:
+        seed_runtime_state_from_env()
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+
             context, page = open_account_page(browser)
 
             buttons = get_booking_buttons(page)
@@ -210,116 +139,115 @@ def check_slots():
 
             log(f"Найдено кнопок: {count}")
 
-            if count == 0:
-                context.close()
-                browser.close()
-                return []
-
             for i in range(count):
-                page.goto(ACCOUNT_URL, timeout=60000)
+                page.goto(ACCOUNT_URL)
                 page.wait_for_timeout(1200)
 
-                if page_shows_login_form(page):
-                    log("Во время проверки сессия слетела, перелогиниваюсь...")
-                    context.close()
-                    context = browser.new_context()
-                    page = login_and_refresh_session(context)
-                    page.goto(ACCOUNT_URL, timeout=60000)
-                    page.wait_for_timeout(1200)
-
                 buttons = get_booking_buttons(page)
-                current_count = buttons.count()
-
-                if i >= current_count:
+                if i >= buttons.count():
                     continue
 
                 button = buttons.nth(i)
-                button_date = extract_date_for_button(button, i)
+                date = extract_date(button, i)
 
-                log(f"Проверяю {button_date}")
+                log(f"Проверяю {date}")
 
-                try:
-                    button.click(timeout=4000)
-                except Exception as e:
-                    log(f"Не удалось кликнуть по {button_date}: {e}")
-                    continue
-
+                button.click()
                 page.wait_for_timeout(1200)
 
-                popup_text = page.content().lower()
+                html = page.content().lower()
 
-                if "все свободные места для записи закончились" in popup_text:
-                    log(f"{button_date}: мест нет")
-                    safe_close_popup(page)
-                    continue
+                if "все свободные места для записи закончились" in html:
+                    log(f"{date}: мест нет")
+                else:
+                    log(f"{date}: слот есть")
+                    dates.append(date)
 
-                log(f"{button_date}: похоже, слот есть")
-                available_dates.append(button_date)
                 safe_close_popup(page)
 
             save_context_state(context)
-            context.close()
             browser.close()
-            return available_dates
 
-        except Exception as e:
-            log(f"Ошибка в check_slots: {e}")
-            try:
-                browser.close()
-            except:
-                pass
-            return []
+            queue.put({"ok": True, "dates": dates})
+
+    except Exception as e:
+        queue.put({"ok": False, "error": str(e), "dates": []})
 
 
-def make_alert_signature(dates):
-    return "|".join(sorted(set(dates)))
+def run_check():
+    queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=_check_worker, args=(queue,))
+    p.start()
+    p.join(CHECK_TIMEOUT_SECONDS)
+
+    if p.is_alive():
+        p.terminate()
+        return {"ok": False, "timeout": True, "dates": []}
+
+    return queue.get() if not queue.empty() else {"ok": False, "dates": []}
 
 
-def build_alert_text(dates):
-    unique_dates = sorted(set(dates))
-
-    if len(unique_dates) == 1:
-        return (
-            "🔥 Похоже, появился слот.\n\n"
-            f"Дата: {unique_dates[0]}\n\n"
-            "Срочно зайди в donor-mos и попробуй записаться."
-        )
-
-    dates_text = "\n".join(f"• {d}" for d in unique_dates)
-
-    return (
-        "🔥 Похоже, появились слоты на несколько дат.\n\n"
-        f"{dates_text}\n\n"
-        "Срочно зайди в donor-mos и попробуй записаться."
-    )
+def build_alert(dates):
+    return "🔥 СЛОТЫ!\n" + "\n".join(dates)
 
 
-log("БОТ 3.2 ЗАПУЩЕН")
+def build_heartbeat(last_time, ok, dates):
+    status = "✅ Бот работает" if ok else "⚠️ Есть ошибки"
 
-last_alert_signature = None
-
-while True:
-    started_at = time.strftime("%H:%M:%S")
-    log(f"Старт проверки: {started_at}")
-
-    available_dates = check_slots()
-
-    finished_at = time.strftime("%H:%M:%S")
-    log(f"Конец проверки: {finished_at}")
-
-    if available_dates:
-        current_signature = make_alert_signature(available_dates)
-        log(f"Найдены доступные даты: {', '.join(sorted(set(available_dates)))}")
-
-        if current_signature != last_alert_signature:
-            send_message(build_alert_text(available_dates))
-            last_alert_signature = current_signature
-            log("Отправлено уведомление в Telegram")
-        else:
-            log("Слоты есть, но уведомление уже отправлялось ранее")
+    if dates:
+        slots = "Даты: " + ", ".join(dates)
     else:
-        log("Слотов не найдено")
-        last_alert_signature = None
+        slots = "Слотов нет"
 
-    log("Жду 30 секунд до следующей проверки...")
-    time.sleep(30)
+    return f"{status}\n\nПоследняя проверка: {last_time}\n{slots}"
+
+
+if __name__ == "__main__":
+    log("БОТ 3.5 ЗАПУЩЕН")
+
+    last_alert = None
+    last_heartbeat_hour = None
+
+    last_ok = True
+    last_dates = []
+    last_time = ""
+
+    while True:
+        now = datetime.now()
+
+        log(f"Старт проверки: {now.strftime('%H:%M:%S')}")
+
+        result = run_check()
+
+        last_time = datetime.now().strftime("%H:%M:%S")
+
+        if result.get("timeout"):
+            log("Завис → убит")
+            last_ok = False
+        elif not result.get("ok"):
+            log("Ошибка")
+            last_ok = False
+        else:
+            last_ok = True
+
+        dates = result.get("dates", [])
+        last_dates = dates
+
+        if dates:
+            sig = "|".join(sorted(dates))
+            if sig != last_alert:
+                send_message(build_alert(dates))
+                last_alert = sig
+        else:
+            last_alert = None
+
+        # ===== ПУЛЬС =====
+        current_hour = now.hour
+
+        if current_hour in HEARTBEAT_HOURS and last_heartbeat_hour != current_hour:
+            send_message(build_heartbeat(last_time, last_ok, last_dates))
+            last_heartbeat_hour = current_hour
+            log("Отправлен heartbeat")
+
+        log("Жду 30 секунд...\n")
+        time.sleep(SLEEP_BETWEEN_CHECKS_SECONDS)
