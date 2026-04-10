@@ -5,6 +5,7 @@ import re
 import requests
 import multiprocessing
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
 
@@ -21,7 +22,12 @@ RUNTIME_STATE_FILE = "/tmp/donor_runtime_state.json"
 CHECK_TIMEOUT_SECONDS = 45
 SLEEP_BETWEEN_CHECKS_SECONDS = 30
 
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 HEARTBEAT_HOURS = {11, 23}
+
+
+def now_moscow():
+    return datetime.now(MOSCOW_TZ)
 
 
 def log(message):
@@ -203,23 +209,23 @@ def build_heartbeat(last_time, ok, dates):
 
 
 if __name__ == "__main__":
-    log("БОТ 3.5 ЗАПУЩЕН")
+    log("БОТ 3.5.1 ЗАПУЩЕН")
 
     last_alert = None
-    last_heartbeat_hour = None
+    last_heartbeat_key = None
 
     last_ok = True
     last_dates = []
     last_time = ""
 
     while True:
-        now = datetime.now()
+        now = now_moscow()
 
         log(f"Старт проверки: {now.strftime('%H:%M:%S')}")
 
         result = run_check()
 
-        last_time = datetime.now().strftime("%H:%M:%S")
+        last_time = now_moscow().strftime("%H:%M:%S")
 
         if result.get("timeout"):
             log("Завис → убит")
@@ -241,12 +247,13 @@ if __name__ == "__main__":
         else:
             last_alert = None
 
-        # ===== ПУЛЬС =====
         current_hour = now.hour
+        current_day = now.strftime("%Y-%m-%d")
+        heartbeat_key = f"{current_day}-{current_hour}"
 
-        if current_hour in HEARTBEAT_HOURS and last_heartbeat_hour != current_hour:
+        if current_hour in HEARTBEAT_HOURS and last_heartbeat_key != heartbeat_key:
             send_message(build_heartbeat(last_time, last_ok, last_dates))
-            last_heartbeat_hour = current_hour
+            last_heartbeat_key = heartbeat_key
             log("Отправлен heartbeat")
 
         log("Жду 30 секунд...\n")
