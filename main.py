@@ -4,8 +4,7 @@ import json
 import re
 import requests
 import multiprocessing
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
 
@@ -22,7 +21,7 @@ RUNTIME_STATE_FILE = "/tmp/donor_runtime_state.json"
 CHECK_TIMEOUT_SECONDS = 120
 SLEEP_BETWEEN_CHECKS_SECONDS = 30
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+MOSCOW_TZ = timezone(timedelta(hours=3))
 HEARTBEAT_HOURS = {11, 23}
 
 
@@ -35,18 +34,21 @@ def log(message):
 
 
 def send_message(text):
-    requests.get(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        params={"chat_id": CHAT_ID, "text": text},
-        timeout=15
-    )
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            params={"chat_id": CHAT_ID, "text": text},
+            timeout=15
+        )
+    except Exception as e:
+        log(f"Ошибка отправки в Telegram: {e}")
 
 
 def safe_close_popup(page):
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
-    except Exception:
+    except:
         pass
 
 
@@ -60,7 +62,7 @@ def save_context_state(context):
         context.storage_state(path=RUNTIME_STATE_FILE)
         log("Runtime-сессия сохранена")
     except Exception as e:
-        log(f"Не удалось сохранить runtime-сессию: {e}")
+        log(f"Ошибка сохранения сессии: {e}")
 
 
 def seed_runtime_state_from_env():
@@ -71,17 +73,18 @@ def seed_runtime_state_from_env():
         try:
             state_data = json.loads(STORAGE_STATE_JSON)
             with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state_data, f, ensure_ascii=False)
-            log("Runtime-сессия восстановлена из STORAGE_STATE_JSON")
+                json.dump(state_data, f)
+            log("Runtime-сессия восстановлена")
         except Exception as e:
-            log(f"Не удалось восстановить runtime-сессию: {e}")
+            log(f"Ошибка восстановления сессии: {e}")
 
 
 def login_and_refresh_session(context):
     if not LOGIN or not PASSWORD:
-        raise RuntimeError("Не заданы LOGIN/PASSWORD")
+        raise RuntimeError("Нет LOGIN/PASSWORD")
 
     log("🔐 логинюсь")
+
     page = context.new_page()
     page.set_default_timeout(20000)
 
@@ -90,6 +93,7 @@ def login_and_refresh_session(context):
 
     page.fill('input[type="text"]', LOGIN)
     page.fill('input[type="password"]', PASSWORD)
+
     page.click("button:has-text('Авторизоваться')")
     page.wait_for_timeout(5000)
 
@@ -97,10 +101,11 @@ def login_and_refresh_session(context):
     page.wait_for_timeout(2500)
 
     if page_shows_login_form(page):
-        raise RuntimeError("После логина сайт всё ещё показывает форму входа")
+        raise RuntimeError("Логин не удался")
 
     save_context_state(context)
-    log("✅ залогинился, сессия обновлена")
+    log("✅ залогинился")
+
     return page
 
 
@@ -112,7 +117,7 @@ def open_account_page(browser):
         log("Использую runtime-сессию")
     else:
         context = browser.new_context()
-        log("Runtime-сессии нет, открою чистый контекст")
+        log("Нет сохранённой сессии")
 
     page = context.new_page()
     page.set_default_timeout(20000)
@@ -139,7 +144,7 @@ def extract_date(button, i):
         match = re.findall(r"\d{2}/\d{2}/\d{4}", text)
         if match:
             return match[-1]
-    except Exception:
+    except:
         pass
     return f"кнопка #{i + 1}"
 
@@ -157,31 +162,28 @@ def _check_worker(queue):
 
             context, page = open_account_page(browser)
 
-            log("📄 читаю список кнопок")
             buttons = get_booking_buttons(page)
             count = buttons.count()
 
             log(f"Найдено кнопок: {count}")
 
             for i in range(count):
-                log(f"🔄 обновляю страницу перед кнопкой #{i + 1}")
+                log(f"🔄 обновляю страницу #{i + 1}")
+
                 page.goto(ACCOUNT_URL, timeout=60000)
                 page.wait_for_timeout(1500)
 
                 if page_shows_login_form(page):
-                    log("Во время проверки сессия слетела → перелогиниваюсь")
+                    log("Сессия слетела → перелогин")
                     context.close()
                     context = browser.new_context()
                     page = login_and_refresh_session(context)
-                    page.set_default_timeout(20000)
-                    page.goto(ACCOUNT_URL, timeout=60000)
+                    page.goto(ACCOUNT_URL)
                     page.wait_for_timeout(1500)
 
                 buttons = get_booking_buttons(page)
-                current_count = buttons.count()
 
-                if i >= current_count:
-                    log(f"Кнопка #{i + 1} исчезла после обновления")
+                if i >= buttons.count():
                     continue
 
                 button = buttons.nth(i)
@@ -192,7 +194,7 @@ def _check_worker(queue):
                 try:
                     button.click(timeout=5000)
                 except Exception as e:
-                    log(f"Не удалось кликнуть по {date}: {e}")
+                    log(f"Ошибка клика: {e}")
                     continue
 
                 page.wait_for_timeout(1500)
@@ -208,14 +210,7 @@ def _check_worker(queue):
                 safe_close_popup(page)
 
             save_context_state(context)
-            try:
-                context.close()
-            except Exception:
-                pass
-            try:
-                browser.close()
-            except Exception:
-                pass
+            browser.close()
 
             queue.put({"ok": True, "dates": dates})
 
@@ -235,78 +230,56 @@ def run_check():
         return {"ok": False, "timeout": True, "dates": []}
 
     if queue.empty():
-        return {"ok": False, "error": "Процесс завершился без результата", "dates": []}
+        return {"ok": False, "error": "Нет результата", "dates": []}
 
     return queue.get()
 
 
 def build_alert(dates):
-    unique_dates = sorted(set(dates))
-    return "🔥 СЛОТЫ!\n" + "\n".join(unique_dates)
+    return "🔥 СЛОТЫ:\n" + "\n".join(sorted(set(dates)))
 
 
-def build_heartbeat(last_time, ok, dates):
-    status = "✅ Бот работает" if ok else "⚠️ Бот работает, но последняя проверка была с ошибкой"
-
-    if dates:
-        slots = "Даты: " + ", ".join(sorted(set(dates)))
-    else:
-        slots = "Слотов нет"
-
-    return f"{status}\n\nПоследняя проверка: {last_time}\n{slots}"
+def build_heartbeat(last_time, ok):
+    status = "✅ работает" if ok else "⚠️ с ошибкой"
+    return f"Бот {status}\nПоследняя проверка: {last_time}"
 
 
 if __name__ == "__main__":
-    log("БОТ 3.6 ЗАПУЩЕН")
+    log("БОТ 3.7 ЗАПУЩЕН")
 
     last_alert = None
     last_heartbeat_key = None
 
-    last_ok = True
-    last_dates = []
-    last_time = ""
-
     while True:
         now = now_moscow()
-
         log(f"Старт проверки: {now.strftime('%H:%M:%S')}")
 
         result = run_check()
 
-        last_time = now_moscow().strftime("%H:%M:%S")
+        last_time = now.strftime("%H:%M:%S")
 
-        if result.get("timeout"):
-            log("Завис → убит")
-            last_ok = False
-        elif not result.get("ok"):
-            log(f"Ошибка: {result.get('error', 'неизвестная ошибка')}")
-            last_ok = False
-        else:
-            last_ok = True
-
+        ok = result.get("ok") and not result.get("timeout")
         dates = result.get("dates", [])
-        last_dates = dates
 
         if dates:
             sig = "|".join(sorted(set(dates)))
+
             if sig != last_alert:
                 send_message(build_alert(dates))
                 last_alert = sig
-                log("Отправлено уведомление о слотах")
-            else:
-                log("Слоты есть, но уведомление уже отправлялось")
+                log("📩 отправлено уведомление")
         else:
-            log("Слотов не найдено")
+            log("Слотов нет")
             last_alert = None
 
-        current_hour = now.hour
-        current_day = now.strftime("%Y-%m-%d")
-        heartbeat_key = f"{current_day}-{current_hour}"
+        hour = now.hour
+        day = now.strftime("%Y-%m-%d")
+        key = f"{day}-{hour}"
 
-        if current_hour in HEARTBEAT_HOURS and last_heartbeat_key != heartbeat_key:
-            send_message(build_heartbeat(last_time, last_ok, last_dates))
-            last_heartbeat_key = heartbeat_key
-            log("Отправлен heartbeat")
+        if hour in HEARTBEAT_HOURS and key != last_heartbeat_key:
+            send_message(build_heartbeat(last_time, ok))
+            last_heartbeat_key = key
+            log("💓 heartbeat отправлен")
 
-        log(f"Жду {SLEEP_BETWEEN_CHECKS_SECONDS} секунд...\n")
+        log(f"Жду {SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
         time.sleep(SLEEP_BETWEEN_CHECKS_SECONDS)
