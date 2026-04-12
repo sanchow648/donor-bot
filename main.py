@@ -23,6 +23,7 @@ SLEEP_BETWEEN_CHECKS_SECONDS = 30
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 HEARTBEAT_HOURS = {11, 23}
+ERROR_STREAK_FOR_ALERT = 3
 
 
 def now_moscow():
@@ -48,7 +49,7 @@ def safe_close_popup(page):
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
-    except:
+    except Exception:
         pass
 
 
@@ -144,7 +145,7 @@ def extract_date(button, i):
         match = re.findall(r"\d{2}/\d{2}/\d{4}", text)
         if match:
             return match[-1]
-    except:
+    except Exception:
         pass
     return f"кнопка #{i + 1}"
 
@@ -178,7 +179,7 @@ def _check_worker(queue):
                     context.close()
                     context = browser.new_context()
                     page = login_and_refresh_session(context)
-                    page.goto(ACCOUNT_URL)
+                    page.goto(ACCOUNT_URL, timeout=60000)
                     page.wait_for_timeout(1500)
 
                 buttons = get_booking_buttons(page)
@@ -236,19 +237,44 @@ def run_check():
 
 
 def build_alert(dates):
-    return "🔥 СЛОТЫ:\n" + "\n".join(sorted(set(dates)))
+    unique_dates = sorted(set(dates))
+    if len(unique_dates) == 1:
+        return (
+            "🔥 Похоже, появился слот.\n\n"
+            f"Дата: {unique_dates[0]}\n\n"
+            "Срочно зайди в donor-mos и попробуй записаться."
+        )
+
+    return (
+        "🔥 Похоже, появились слоты на несколько дат.\n\n"
+        + "\n".join(f"• {d}" for d in unique_dates)
+        + "\n\nСрочно зайди в donor-mos и попробуй записаться."
+    )
 
 
-def build_heartbeat(last_time, ok):
-    status = "✅ работает" if ok else "⚠️ с ошибкой"
-    return f"Бот {status}\nПоследняя проверка: {last_time}"
+def build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat):
+    if error_streak >= ERROR_STREAK_FOR_ALERT:
+        status = "🚨 Бот с ошибкой"
+    elif recovered_since_last_heartbeat:
+        status = "⚠️ Бот восстановился после сбоев"
+    else:
+        status = "✅ Бот работает"
+
+    return (
+        f"{status}\n\n"
+        f"Последняя проверка: {last_time}"
+    )
 
 
 if __name__ == "__main__":
-    log("БОТ 3.7 ЗАПУЩЕН")
+    log("БОТ 3.8 ЗАПУЩЕН")
 
     last_alert = None
     last_heartbeat_key = None
+
+    error_streak = 0
+    had_errors_since_last_heartbeat = False
+    last_time = ""
 
     while True:
         now = now_moscow()
@@ -256,10 +282,22 @@ if __name__ == "__main__":
 
         result = run_check()
 
-        last_time = now.strftime("%H:%M:%S")
+        last_time = now_moscow().strftime("%H:%M:%S")
 
         ok = result.get("ok") and not result.get("timeout")
         dates = result.get("dates", [])
+
+        if ok:
+            if error_streak > 0:
+                log("🛠️ Проверка снова успешна после ошибок")
+            error_streak = 0
+        else:
+            error_streak += 1
+            had_errors_since_last_heartbeat = True
+            if result.get("timeout"):
+                log("⛔ Проверка зависла → убита watchdog-таймаутом")
+            else:
+                log(f"❌ Ошибка: {result.get('error', 'неизвестная ошибка')}")
 
         if dates:
             sig = "|".join(sorted(set(dates)))
@@ -267,7 +305,9 @@ if __name__ == "__main__":
             if sig != last_alert:
                 send_message(build_alert(dates))
                 last_alert = sig
-                log("📩 отправлено уведомление")
+                log("📩 отправлено уведомление о слотах")
+            else:
+                log("ℹ️ Слоты есть, но такое уведомление уже отправлялось")
         else:
             log("Слотов нет")
             last_alert = None
@@ -277,9 +317,11 @@ if __name__ == "__main__":
         key = f"{day}-{hour}"
 
         if hour in HEARTBEAT_HOURS and key != last_heartbeat_key:
-            send_message(build_heartbeat(last_time, ok))
+            recovered_since_last_heartbeat = had_errors_since_last_heartbeat and error_streak == 0
+            send_message(build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat))
             last_heartbeat_key = key
+            had_errors_since_last_heartbeat = False
             log("💓 heartbeat отправлен")
 
-        log(f"Жду {SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
+        log(f"Жду {SLEEP_BETWEEN_CHECKС_SECONDS if 'SLEEP_BETWEEN_CHECKС_SECONDS' in globals() else SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
         time.sleep(SLEEP_BETWEEN_CHECKS_SECONDS)
