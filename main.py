@@ -94,7 +94,6 @@ def login_and_refresh_session(context):
 
     page.fill('input[type="text"]', LOGIN)
     page.fill('input[type="password"]', PASSWORD)
-
     page.click("button:has-text('Авторизоваться')")
     page.wait_for_timeout(5000)
 
@@ -106,7 +105,6 @@ def login_and_refresh_session(context):
 
     save_context_state(context)
     log("✅ залогинился")
-
     return page
 
 
@@ -159,7 +157,15 @@ def _check_worker(queue):
 
         with sync_playwright() as p:
             log("🚀 запускаю браузер")
-            browser = p.chromium.launch(headless=True)
+
+            # ВАЖНО:
+            # channel="chromium" заставляет использовать обычный Chromium,
+            # а не chromium_headless_shell, которого у тебя сейчас нет.
+            browser = p.chromium.launch(
+                channel="chromium",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
 
             context, page = open_account_page(browser)
 
@@ -260,14 +266,11 @@ def build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat):
     else:
         status = "✅ Бот работает"
 
-    return (
-        f"{status}\n\n"
-        f"Последняя проверка: {last_time}"
-    )
+    return f"{status}\n\nПоследняя проверка: {last_time}"
 
 
 if __name__ == "__main__":
-    log("БОТ 3.8 ЗАПУЩЕН")
+    log("БОТ 3.9 ЗАПУЩЕН")
 
     last_alert = None
     last_heartbeat_key = None
@@ -301,7 +304,6 @@ if __name__ == "__main__":
 
         if dates:
             sig = "|".join(sorted(set(dates)))
-
             if sig != last_alert:
                 send_message(build_alert(dates))
                 last_alert = sig
@@ -323,5 +325,5 @@ if __name__ == "__main__":
             had_errors_since_last_heartbeat = False
             log("💓 heartbeat отправлен")
 
-        log(f"Жду {SLEEP_BETWEEN_CHECKС_SECONDS if 'SLEEP_BETWEEN_CHECKС_SECONDS' in globals() else SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
+        log(f"Жду {SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
         time.sleep(SLEEP_BETWEEN_CHECKS_SECONDS)
