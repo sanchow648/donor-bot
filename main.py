@@ -24,6 +24,7 @@ SLEEP_BETWEEN_CHECKS_SECONDS = 30
 MOSCOW_TZ = timezone(timedelta(hours=3))
 HEARTBEAT_HOURS = {11, 23}
 ERROR_STREAK_FOR_ALERT = 3
+RESTART_AFTER_TIMEOUT_STREAK = 3
 
 
 def now_moscow():
@@ -76,9 +77,8 @@ def page_shows_login_form(page):
 def save_context_state(context):
     try:
         context.storage_state(path=RUNTIME_STATE_FILE)
-        log("Runtime-сессия сохранена")
-    except Exception as e:
-        log(f"Ошибка сохранения сессии: {e}")
+    except Exception:
+        pass
 
 
 def seed_runtime_state_from_env():
@@ -90,16 +90,13 @@ def seed_runtime_state_from_env():
             state_data = json.loads(STORAGE_STATE_JSON)
             with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state_data, f)
-            log("Runtime-сессия восстановлена")
-        except Exception as e:
-            log(f"Ошибка восстановления сессии: {e}")
+        except Exception:
+            pass
 
 
 def login_and_refresh_session(context):
     if not LOGIN or not PASSWORD:
         raise RuntimeError("Нет LOGIN/PASSWORD")
-
-    log("🔐 логинюсь")
 
     page = context.new_page()
     page.set_default_timeout(20000)
@@ -119,19 +116,14 @@ def login_and_refresh_session(context):
         raise RuntimeError("Логин не удался")
 
     save_context_state(context)
-    log("✅ залогинился")
     return page
 
 
 def open_account_page(browser):
-    log("🌐 открываю account")
-
     if os.path.exists(RUNTIME_STATE_FILE):
         context = browser.new_context(storage_state=RUNTIME_STATE_FILE)
-        log("Использую runtime-сессию")
     else:
         context = browser.new_context()
-        log("Нет сохранённой сессии")
 
     page = context.new_page()
     page.set_default_timeout(20000)
@@ -140,7 +132,6 @@ def open_account_page(browser):
     page.wait_for_timeout(2000)
 
     if page_shows_login_form(page):
-        log("Сессия протухла → логинюсь заново")
         context.close()
         context = browser.new_context()
         page = login_and_refresh_session(context)
@@ -183,16 +174,11 @@ def _check_worker(queue):
             buttons = get_booking_buttons(page)
             count = buttons.count()
 
-            log(f"Найдено кнопок: {count}")
-
             for i in range(count):
-                log(f"🔄 обновляю страницу #{i + 1}")
-
                 page.goto(ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
                 page.wait_for_timeout(1500)
 
                 if page_shows_login_form(page):
-                    log("Сессия слетела → перелогин")
                     context.close()
                     context = browser.new_context()
                     page = login_and_refresh_session(context)
@@ -207,22 +193,16 @@ def _check_worker(queue):
                 button = buttons.nth(i)
                 date = extract_date(button, i)
 
-                log(f"Проверяю {date}")
-
                 try:
                     button.click(timeout=5000)
-                except Exception as e:
-                    log(f"Ошибка клика: {e}")
+                except Exception:
                     continue
 
                 page.wait_for_timeout(1500)
 
                 html = page.content().lower()
 
-                if "все свободные места для записи закончились" in html:
-                    log(f"{date}: мест нет")
-                else:
-                    log(f"{date}: слот есть")
+                if "все свободные места для записи закончились" not in html:
                     dates.append(date)
 
                 safe_close_popup(page)
@@ -280,8 +260,19 @@ def build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat):
     return f"{status}\n\nПоследняя проверка: {last_time}"
 
 
+def classify_state(result):
+    if result.get("timeout"):
+        return "timeout", "Проверка зависла → убита watchdog-таймаутом"
+
+    if not result.get("ok"):
+        error_text = result.get("error", "неизвестная ошибка")
+        return f"error:{error_text}", f"Ошибка: {error_text}"
+
+    return "ok", "Проверка успешна"
+
+
 if __name__ == "__main__":
-    log("БОТ 4.0 ЗАПУЩЕН")
+    log("БОТ 4.2 ЗАПУЩЕН")
 
     last_alert = None
     last_heartbeat_key = None
@@ -290,39 +281,57 @@ if __name__ == "__main__":
     had_errors_since_last_heartbeat = False
     last_time = ""
 
+    last_state_key = None
+    timeout_streak = 0
+
     while True:
         now = now_moscow()
         log(f"Старт проверки: {now.strftime('%H:%M:%S')}")
 
         result = run_check()
-
         last_time = now_moscow().strftime("%H:%M:%S")
 
-        ok = result.get("ok") and not result.get("timeout")
+        state_key, state_text = classify_state(result)
+        ok = state_key == "ok"
         dates = result.get("dates", [])
 
         if ok:
-            if error_streak > 0:
-                log("🛠️ Проверка снова успешна после ошибок")
+            if last_state_key != "ok":
+                log("Проверка снова успешна")
             error_streak = 0
+            timeout_streak = 0
         else:
             error_streak += 1
             had_errors_since_last_heartbeat = True
+
             if result.get("timeout"):
-                log("⛔ Проверка зависла → убита watchdog-таймаутом")
+                timeout_streak += 1
+
+                if state_key != last_state_key:
+                    log(f"{state_text} ({timeout_streak}/{RESTART_AFTER_TIMEOUT_STREAK})")
+                else:
+                    log(f"Повторное зависание ({timeout_streak}/{RESTART_AFTER_TIMEOUT_STREAK})")
+
+                if timeout_streak >= RESTART_AFTER_TIMEOUT_STREAK:
+                    send_message("♻️ Бот уходит в самоперезапуск: несколько проверок подряд зависли.")
+                    log("♻️ Слишком много подряд зависаний, завершаю процесс для рестарта Railway")
+                    os._exit(1)
             else:
-                log(f"❌ Ошибка: {result.get('error', 'неизвестная ошибка')}")
+                timeout_streak = 0
+                if state_key != last_state_key:
+                    log(state_text)
+
+        last_state_key = state_key
 
         if dates:
             sig = "|".join(sorted(set(dates)))
             if sig != last_alert:
                 send_message(build_alert(dates))
                 last_alert = sig
-                log("📩 отправлено уведомление о слотах")
-            else:
-                log("ℹ️ Слоты есть, но такое уведомление уже отправлялось")
+                log("Отправлено уведомление о слотах")
         else:
-            log("Слотов нет")
+            if last_state_key == "ok":
+                log("Слотов нет")
             last_alert = None
 
         hour = now.hour
@@ -334,7 +343,7 @@ if __name__ == "__main__":
             send_message(build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat))
             last_heartbeat_key = key
             had_errors_since_last_heartbeat = False
-            log("💓 heartbeat отправлен")
+            log("Heartbeat отправлен")
 
         log(f"Жду {SLEEP_BETWEEN_CHECKS_SECONDS} сек\n")
         time.sleep(SLEEP_BETWEEN_CHECKS_SECONDS)
