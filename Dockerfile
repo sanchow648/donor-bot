@@ -7,7 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# 🔥 ВАЖНО: ставим браузер ОДИН РАЗ при сборке
-RUN playwright install chromium
+RUN playwright install chromium chromium-headless-shell
 
 CMD ["python", "main.py"]
