@@ -18,7 +18,7 @@ ACCOUNT_URL = "https://donor-mos.online/account/"
 LOGIN_URL = "https://donor-mos.online/"
 RUNTIME_STATE_FILE = "/tmp/donor_runtime_state.json"
 
-CHECK_TIMEOUT_SECONDS = 120
+CHECK_TIMEOUT_SECONDS = 180
 SLEEP_BETWEEN_CHECKS_SECONDS = 30
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -46,6 +46,21 @@ def send_message(text):
 
 
 def safe_close_popup(page):
+    selectors = [
+        'button:has-text("×")',
+        'text=×',
+        '[aria-label="Close"]',
+        '[aria-label="Закрыть"]',
+    ]
+
+    for sel in selectors:
+        try:
+            page.locator(sel).first.click(timeout=1000)
+            page.wait_for_timeout(300)
+            return
+        except Exception:
+            pass
+
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
@@ -89,7 +104,7 @@ def login_and_refresh_session(context):
     page = context.new_page()
     page.set_default_timeout(20000)
 
-    page.goto(LOGIN_URL, timeout=60000)
+    page.goto(LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(1500)
 
     page.fill('input[type="text"]', LOGIN)
@@ -97,7 +112,7 @@ def login_and_refresh_session(context):
     page.click("button:has-text('Авторизоваться')")
     page.wait_for_timeout(5000)
 
-    page.goto(ACCOUNT_URL, timeout=60000)
+    page.goto(ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
 
     if page_shows_login_form(page):
@@ -121,7 +136,7 @@ def open_account_page(browser):
     page = context.new_page()
     page.set_default_timeout(20000)
 
-    page.goto(ACCOUNT_URL, timeout=60000)
+    page.goto(ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(2000)
 
     if page_shows_login_form(page):
@@ -157,10 +172,6 @@ def _check_worker(queue):
 
         with sync_playwright() as p:
             log("🚀 запускаю браузер")
-
-            # ВАЖНО:
-            # channel="chromium" заставляет использовать обычный Chromium,
-            # а не chromium_headless_shell, которого у тебя сейчас нет.
             browser = p.chromium.launch(
                 channel="chromium",
                 headless=True,
@@ -177,7 +188,7 @@ def _check_worker(queue):
             for i in range(count):
                 log(f"🔄 обновляю страницу #{i + 1}")
 
-                page.goto(ACCOUNT_URL, timeout=60000)
+                page.goto(ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
                 page.wait_for_timeout(1500)
 
                 if page_shows_login_form(page):
@@ -185,7 +196,7 @@ def _check_worker(queue):
                     context.close()
                     context = browser.new_context()
                     page = login_and_refresh_session(context)
-                    page.goto(ACCOUNT_URL, timeout=60000)
+                    page.goto(ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
                     page.wait_for_timeout(1500)
 
                 buttons = get_booking_buttons(page)
@@ -270,7 +281,7 @@ def build_heartbeat(last_time, error_streak, recovered_since_last_heartbeat):
 
 
 if __name__ == "__main__":
-    log("БОТ 3.9 ЗАПУЩЕН")
+    log("БОТ 4.0 ЗАПУЩЕН")
 
     last_alert = None
     last_heartbeat_key = None
